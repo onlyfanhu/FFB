@@ -12,7 +12,6 @@ import time
 
 from google.oauth2.service_account import Credentials
 import gspread
-import gspread.exceptions
 import pandas as pd
 import requests
 import streamlit as st
@@ -20,9 +19,6 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 # CONFIGURAÇÃO
 # ----------------------------------------------------------------------------
-
-
-
 COLUMN_MAP = {
     "nome_da_banda": "nome_da_banda",
     "foto_promo": "foto_promo",
@@ -47,7 +43,7 @@ st.set_page_config(
 )
 
 # ----------------------------------------------------------------------------
-# CSS
+# CSS - visual limpo e moderno
 # ----------------------------------------------------------------------------
 st.markdown(
     """
@@ -103,21 +99,6 @@ st.markdown(
 
 
 # ----------------------------------------------------------------------------
-# TRATAMENTO DE REQUISIÇÕES COM RETRY (PROTEÇÃO CONTRA ERRO 429)
-# ----------------------------------------------------------------------------
-def safe_api_call(func, *args, **kwargs):
-  max_retries = 3
-  for attempt in range(max_retries):
-    try:
-      return func(*args, **kwargs)
-    except gspread.exceptions.APIError as err:
-      if "429" in str(err) and attempt < max_retries - 1:
-        time.sleep(2 * (attempt + 1))
-        continue
-      raise err
-
-
-# ----------------------------------------------------------------------------
 # UTILITÁRIOS DE MÍDIA
 # ----------------------------------------------------------------------------
 def _extract_drive_file_id(url: str) -> str | None:
@@ -149,6 +130,13 @@ def _extract_youtube_id(url: str) -> str | None:
   return None
 
 
+def _permission_error_message() -> str:
+  return (
+      "O arquivo não está compartilhado publicamente no Google Drive. "
+      "Compartilhe-o como 'Qualquer pessoa com o link' → Leitor."
+  )
+
+
 def convert_drive_image_url(url: str, timeout: int = 10) -> bytes | str | None:
   if not url:
     return None
@@ -161,10 +149,9 @@ def convert_drive_image_url(url: str, timeout: int = 10) -> bytes | str | None:
 
   try:
     response = requests.get(direct_url, timeout=timeout, allow_redirects=True)
+
     if "accounts.google.com" in response.url:
-      st.session_state["_last_image_error"] = (
-          "Foto sem permissão pública no Drive."
-      )
+      st.session_state["_last_image_error"] = _permission_error_message()
       return None
 
     response.raise_for_status()
@@ -186,24 +173,26 @@ def convert_drive_image_url(url: str, timeout: int = 10) -> bytes | str | None:
       response = requests.get(
           confirm_url, timeout=timeout, allow_redirects=True
       )
+
       if "accounts.google.com" in response.url:
-        st.session_state["_last_image_error"] = (
-            "Foto sem permissão pública no Drive."
-        )
+        st.session_state["_last_image_error"] = _permission_error_message()
         return None
 
       response.raise_for_status()
       content_type = response.headers.get("Content-Type", "")
 
     if not content_type.startswith("image/"):
-      st.session_state["_last_image_error"] = "O link não aponta para uma imagem."
+      st.session_state["_last_image_error"] = (
+          f"O Drive retornou um conteúdo inesperado ({content_type or 'desconhecido'}). "
+          "Verifique se o arquivo é uma imagem pública."
+      )
       return None
 
     st.session_state.pop("_last_image_error", None)
     return response.content
 
   except requests.RequestException as exc:
-    st.session_state["_last_image_error"] = f"Erro ao carregar imagem: {exc}"
+    st.session_state["_last_image_error"] = f"Erro de rede ao baixar a imagem: {exc}"
     return None
 
 
@@ -231,7 +220,7 @@ def convert_media_to_embed(url: str) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# CONEXÃO COM GOOGLE SHEETS
+# CONEXÃO COM GOOGLE SHEETS (CORRIGIDO)
 # ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
@@ -241,7 +230,7 @@ def get_gspread_client():
   elif "GOOGLE_CREDENTIALS" in st.secrets:
     creds_data = dict(st.secrets["GOOGLE_CREDENTIALS"])
   else:
-    st.error("Variável GOOGLE_CREDENTIALS não encontrada no ambiente.")
+    st.error("Variável GOOGLE_CREDENTIALS não encontrada.")
     st.stop()
 
   credentials = Credentials.from_service_account_info(
@@ -252,25 +241,32 @@ def get_gspread_client():
 
 def get_spreadsheet():
   client = get_gspread_client()
+
+  # Lê a URL da planilha configurada no Render (Environment Variables)
   sheet_url = os.environ.get("SHEET_URL")
 
   if sheet_url:
-    return safe_api_call(client.open_by_url, sheet_url)
+    return client.open_by_url(sheet_url)
 
-  all_sheets = safe_api_call(client.openall)
-  return all_sheets[0]
+  # Caso não encontre SHEET_URL, abre a primeira planilha associada à conta de serviço
+  return client.openall()[0]
 
 
 def get_main_worksheet() -> gspread.Worksheet:
+  """Abre a aba principal (respostas do Forms)."""
   spreadsheet = get_spreadsheet()
+
+  # Lê o nome da aba da variável de ambiente no Render (se existir)
   worksheet_name = os.environ.get("WORKSHEET_NAME")
 
   if worksheet_name:
     try:
-      return safe_api_call(spreadsheet.worksheet, worksheet_name)
+      return spreadsheet.worksheet(worksheet_name)
     except Exception:
       pass
-  return safe_api_call(getattr, spreadsheet, "sheet1")
+
+  # Se não houver nome especificado, abre a primeira aba (sheet1)
+  return spreadsheet.sheet1
 
 
 def load_bands_data(force_refresh: bool = False) -> pd.DataFrame:
@@ -279,10 +275,10 @@ def load_bands_data(force_refresh: bool = False) -> pd.DataFrame:
   return _load_bands_data_cached()
 
 
-@st.cache_data(ttl=600, show_spinner="Carregando dados das bandas...")
+@st.cache_data(ttl=30, show_spinner="Carregando dados das bandas...")
 def _load_bands_data_cached() -> pd.DataFrame:
   worksheet = get_main_worksheet()
-  records = safe_api_call(worksheet.get_all_records)
+  records = worksheet.get_all_records()
   return pd.DataFrame(records)
 
 
@@ -293,15 +289,12 @@ def get_or_create_curator_worksheet(curator_name: str) -> gspread.Worksheet:
   spreadsheet = get_spreadsheet()
   safe_name = curator_name.strip()
   try:
-    worksheet = safe_api_call(spreadsheet.worksheet, safe_name)
-  except Exception:
-    worksheet = safe_api_call(
-        spreadsheet.add_worksheet,
-        title=safe_name,
-        rows=200,
-        cols=len(CURATOR_SHEET_HEADERS),
+    worksheet = spreadsheet.worksheet(safe_name)
+  except gspread.exceptions.WorksheetNotFound:
+    worksheet = spreadsheet.add_worksheet(
+        title=safe_name, rows=200, cols=len(CURATOR_SHEET_HEADERS)
     )
-    safe_api_call(worksheet.update, "A1", [CURATOR_SHEET_HEADERS])
+    worksheet.update("A1", [CURATOR_SHEET_HEADERS])
   return worksheet
 
 
@@ -311,12 +304,10 @@ def load_curator_votes(curator_name: str, force_refresh: bool = False) -> dict:
   return _load_curator_votes_cached(curator_name)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def _load_curator_votes_cached(curator_name: str) -> dict:
   worksheet = get_or_create_curator_worksheet(curator_name)
-  records = safe_api_call(
-      worksheet.get_all_records, expected_headers=CURATOR_SHEET_HEADERS
-  )
+  records = worksheet.get_all_records(expected_headers=CURATOR_SHEET_HEADERS)
 
   votes = {}
   for i, record in enumerate(records, start=2):
@@ -336,26 +327,21 @@ def save_vote_in_curator_sheet(
 ) -> None:
   worksheet = get_or_create_curator_worksheet(curator_name)
 
+  existing_row = None
   try:
-    cell = safe_api_call(worksheet.find, banda_nome, in_column=1)
-    row_num = cell.row if cell else None
-  except Exception:
-    row_num = None
+    cell = worksheet.find(banda_nome, in_column=1)
+    existing_row = cell.row if cell else None
+  except gspread.exceptions.CellNotFound:
+    existing_row = None
 
-  if not row_num:
-    col_vals = safe_api_call(worksheet.col_values, 1)
-    row_num = len(col_vals) + 1
-
+  row_num = existing_row if existing_row else len(worksheet.col_values(1)) + 1
   formula_media = f"={AVERAGE_FUNCTION_NAME}(B{row_num}:C{row_num})"
 
-  safe_api_call(
-      worksheet.update,
+  worksheet.update(
       f"A{row_num}:D{row_num}",
       [[banda_nome, nota_resposta, nota_video, formula_media]],
       value_input_option="USER_ENTERED",
   )
-
-  st.cache_data.clear()
 
 
 # ----------------------------------------------------------------------------
@@ -414,8 +400,8 @@ def render_video(row: pd.Series) -> None:
   elif media["type"] == "drive_iframe":
     st.components.v1.iframe(media["url"], height=480)
     st.caption(
-        "Se o vídeo não carregar, verifique se está compartilhado publicamente"
-        f" no Drive. [Abrir diretamente]({video_url})"
+        "Se o vídeo não carregar, verifique o compartilhamento no Drive. "
+        f"[Abrir vídeo diretamente no Drive]({video_url})"
     )
   else:
     st.warning("Nenhum vídeo cadastrado para esta banda.")
@@ -510,7 +496,6 @@ def main() -> None:
 
   try:
     df = load_bands_data()
-      st.write (df)
   except Exception as exc:
     st.error("Não foi possível carregar a planilha principal.")
     st.exception(exc)
