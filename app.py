@@ -242,15 +242,13 @@ def get_gspread_client():
 def get_spreadsheet():
   client = get_gspread_client()
 
-  # Busca a URL da planilha das variáveis do Render ou dos secrets
+  # Lê a URL da planilha configurada no Render (Environment Variables)
   sheet_url = os.environ.get("SHEET_URL")
-  if not sheet_url and "sheet" in st.secrets:
-    sheet_url = st.secrets["sheet"].get("sheet_url")
 
   if sheet_url:
     return client.open_by_url(sheet_url)
 
-  # Fallback: se não houver URL, abre a primeira planilha disponível para a conta
+  # Caso não encontre SHEET_URL, abre a primeira planilha associada à conta de serviço
   return client.openall()[0]
 
 
