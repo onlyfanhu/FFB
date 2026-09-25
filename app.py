@@ -19,6 +19,7 @@ import time
 
 import json
 import os
+import gspread
 import streamlit as st
 
 import gspread
@@ -271,33 +272,26 @@ def convert_media_to_embed(url: str) -> dict:
 # CONEXÃO COM GOOGLE SHEETS
 # ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-import json
-import os
-import gspread
-import streamlit as st
+
 
 
 def get_gspread_client():
-  # 1. Tenta carregar das Variáveis de Ambiente do Render
   if "GOOGLE_CREDENTIALS" in os.environ:
     creds_data = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    return gspread.service_account_from_dict(creds_data)
-
-  # 2. Se não existir no Render, tenta carregar do Secrets local do Streamlit
-  elif "gcp_service_account" in st.secrets:
-    creds_data = dict(st.secrets["gcp_service_account"])
-    # Trata quebras de linha na chave privada caso venham formatadas do TOML
-    if "private_key" in creds_data:
-      creds_data["private_key"] = creds_data["private_key"].replace(
-          "\\n", "\n"
-      )
-    return gspread.service_account_from_dict(creds_data)
-
+  elif "GOOGLE_CREDENTIALS" in st.secrets:
+    creds_data = dict(st.secrets["GOOGLE_CREDENTIALS"])
   else:
-    st.error("Credenciais do Google Sheets não encontradas!")
-    st.stop()
-  # ... resto do código para autenticar no gspread
+    raise Exception("Variável GOOGLE_CREDENTIALS não encontrada.")
 
+  scopes = [
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive",
+  ]
+
+  credentials = Credentials.from_service_account_info(
+      creds_data, scopes=scopes
+  )
+  return gspread.authorize(credentials)
 
 @st.cache_resource(show_spinner=False)
 def get_sheet_config():
