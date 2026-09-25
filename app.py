@@ -509,9 +509,8 @@ def main() -> None:
   todas_bandas = df[COLUMN_MAP["nome_da_banda"]].astype(str).tolist()
   pending_bandas = [b for b in todas_bandas if b not in curator_votes]
 
-  if (
-      "current_banda" not in st.session_state
-      or st.session_state["current_banda"] not in pending_bandas
+  if ("current_banda" not in st.session_state
+        or st.session_state["current_banda"] not in pending_bandas
   ):
     st.session_state["current_banda"] = (
         pending_bandas[0] if pending_bandas else None
