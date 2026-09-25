@@ -17,6 +17,10 @@ import html
 import re
 import time
 
+import json
+import os
+import streamlit as st
+
 import gspread
 import pandas as pd
 import requests
@@ -267,11 +271,20 @@ def convert_media_to_embed(url: str) -> dict:
 # CONEXÃO COM GOOGLE SHEETS
 # ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def get_gspread_client() -> gspread.Client:
-    """Cria o cliente gspread autenticado a partir de st.secrets."""
-    credentials_info = dict(st.secrets["gcp_service_account"])
-    creds = Credentials.from_service_account_info(credentials_info, scopes=SCOPES)
-    return gspread.authorize(creds)
+def get_gspread_client():
+  # Tenta ler das Variáveis de Ambiente do Render primeiro
+  if "GOOGLE_CREDENTIALS" in os.environ:
+    credentials_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+  # Se não encontrar, tenta ler do st.secrets
+  elif "GOOGLE_CREDENTIALS" in st.secrets:
+    credentials_info = dict(st.secrets["GOOGLE_CREDENTIALS"])
+  else:
+    raise ValueError(
+        "Nenhuma credencial do Google encontrada nas variáveis de ambiente ou"
+        " st.secrets."
+    )
+
+  # ... resto do código para autenticar no gspread
 
 
 @st.cache_resource(show_spinner=False)
