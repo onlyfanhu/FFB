@@ -253,16 +253,19 @@ def get_spreadsheet():
 
 
 def get_main_worksheet() -> gspread.Worksheet:
+  """Abre a aba principal (respostas do Forms)."""
   spreadsheet = get_spreadsheet()
+
+  # Lê o nome da aba da variável de ambiente no Render (se existir)
   worksheet_name = os.environ.get("WORKSHEET_NAME")
-  if not worksheet_name and "sheet" in st.secrets:
-    worksheet_name = st.secrets["sheet"].get("worksheet_name")
 
   if worksheet_name:
     try:
       return spreadsheet.worksheet(worksheet_name)
     except Exception:
       pass
+
+  # Se não houver nome especificado, abre a primeira aba (sheet1)
   return spreadsheet.sheet1
 
 
