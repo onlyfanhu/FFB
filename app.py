@@ -20,6 +20,9 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 # CONFIGURAÇÃO
 # ----------------------------------------------------------------------------
+
+
+
 COLUMN_MAP = {
     "nome_da_banda": "nome_da_banda",
     "foto_promo": "foto_promo",
@@ -507,6 +510,7 @@ def main() -> None:
 
   try:
     df = load_bands_data()
+      st.write (df)
   except Exception as exc:
     st.error("Não foi possível carregar a planilha principal.")
     st.exception(exc)
