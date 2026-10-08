@@ -1,9 +1,3 @@
-streamlit>=1.38
-pandas>=2.2
-gspread>=6.1
-google-auth>=2.30
-requests>=2.32
-
 """
 Curadoria & Votação de Seletivas de Bandas
 ===========================================
@@ -22,6 +16,8 @@ Configuração necessária: veja README.md e .streamlit/secrets.toml.example
 import html
 import re
 import time
+import unicodedata
+from urllib.parse import urlparse
 
 import gspread
 import pandas as pd
@@ -47,6 +43,23 @@ COLUMN_MAP = {
     # na sua planilha (copie e cole o texto da pergunta, com acentos etc.).
     "resposta_lineup": "Por que você merece estar no lineup?",
 }
+
+# Fallback automático: se o cabeçalho acima não for encontrado, o app procura
+# uma coluna cujo cabeçalho contenha TODAS as palavras de algum dos grupos
+# abaixo (ignorando acentos e maiúsculas). Os grupos são testados em ordem.
+# Você só precisa mexer aqui se a detecção automática errar a coluna — o
+# painel lateral "Colunas detectadas" mostra o que foi escolhido.
+COLUMN_KEYWORDS = {
+    "nome_da_banda": [["nome", "banda"], ["nome", "artista"], ["nome", "grupo"], ["banda"]],
+    "resposta_lineup": [["lineup"], ["merece"]],
+    "foto_promo": [["foto"], ["imagem"]],
+    "instagram_da_banda": [["instagram"], ["insta"]],
+    "streaming_da_banda": [["streaming"], ["spotify"], ["deezer"], ["ouvir"]],
+    "video_da_banda": [["video"]],
+}
+
+# Sem esta coluna o app não consegue funcionar; as demais são opcionais.
+REQUIRED_COLUMNS = ["nome_da_banda"]
 
 # Cabeçalho padrão criado na aba de cada curador na primeira vez que ele usa
 # o app. A ordem das colunas aqui DEVE bater com a ordem usada em
@@ -293,38 +306,161 @@ def get_main_worksheet() -> gspread.Worksheet:
     spreadsheet = get_spreadsheet()
     worksheet_name = st.secrets["sheet"].get("worksheet_name")
     if worksheet_name:
-        return spreadsheet.worksheet(worksheet_name)
+        try:
+            return spreadsheet.worksheet(worksheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            # Nome errado (ex.: nome da TABELA "Form_Responses" em vez do nome
+            # da ABA). Cai para a 1ª aba; _load_bands_data_cached ainda tenta
+            # achar a aba certa automaticamente.
+            pass
     return spreadsheet.sheet1
 
 
-def load_bands_data(force_refresh: bool = False) -> pd.DataFrame:
-    """Carrega a planilha principal (dados das bandas) em um DataFrame."""
+def _normalize(text: str) -> str:
+    """Minúsculas, sem acento e sem pontuação: 'Vídeo da Banda?' -> 'video da banda'."""
+    text = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def resolve_columns(headers) -> dict:
+    """
+    Descobre qual cabeçalho real da planilha corresponde a cada campo lógico
+    de COLUMN_MAP. Retorna {campo: cabeçalho_real ou None}.
+
+    1) Correspondência exata com o valor de COLUMN_MAP (ignorando acento,
+       maiúscula e pontuação).
+    2) Fallback por palavras-chave (COLUMN_KEYWORDS).
+    Uma mesma coluna nunca é atribuída a dois campos.
+    """
+    headers = list(headers)
+    norm = {h: _normalize(h) for h in headers}
+    resolved = {key: None for key in COLUMN_MAP}
+    used = set()
+
+    for key, wanted in COLUMN_MAP.items():
+        for h in headers:
+            if h not in used and norm[h] == _normalize(wanted):
+                resolved[key] = h
+                used.add(h)
+                break
+
+    for key, groups in COLUMN_KEYWORDS.items():
+        if resolved.get(key):
+            continue
+        for tokens in groups:
+            match = next(
+                (
+                    h for h in headers
+                    if h not in used
+                    and all(any(w.startswith(t) for w in norm[h].split()) for t in tokens)
+                ),
+                None,
+            )
+            if match:
+                resolved[key] = h = match
+                used.add(h)
+                break
+
+    return resolved
+
+
+def _make_unique_headers(headers: list) -> list:
+    """Dá nome a cabeçalhos vazios e desduplica repetidos (comum em Forms)."""
+    seen, result = {}, []
+    for i, h in enumerate(headers):
+        name = str(h).strip() or f"coluna_{i + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 1
+        result.append(name)
+    return result
+
+
+def load_bands_data(force_refresh: bool = False) -> tuple[pd.DataFrame, str]:
+    """Carrega a planilha principal. Retorna (DataFrame, título_da_aba_lida)."""
     if force_refresh:
         st.cache_data.clear()
     return _load_bands_data_cached()
 
 
+def _looks_like_bands_sheet(raw_headers: list) -> bool:
+    """
+    True se a linha 1 parece ser a de uma aba de inscrições de bandas: precisa
+    achar a coluna do nome da banda + pelo menos 3 dos campos conhecidos.
+    Abas de curadores (Banda | Nota Resposta | ...) são excluídas de propósito.
+    """
+    cleaned = [str(h).strip() for h in raw_headers]
+    if cleaned[: len(CURATOR_SHEET_HEADERS)] == CURATOR_SHEET_HEADERS:
+        return False
+    resolved = resolve_columns(_make_unique_headers(cleaned))
+    return bool(resolved.get("nome_da_banda")) and sum(1 for v in resolved.values() if v) >= 3
+
+
 @st.cache_data(ttl=30, show_spinner="Carregando dados das bandas...")
-def _load_bands_data_cached() -> pd.DataFrame:
+def _load_bands_data_cached() -> tuple[pd.DataFrame, str]:
     worksheet = get_main_worksheet()
-    records = worksheet.get_all_records()
-    return pd.DataFrame(records)
+    # get_all_values (em vez de get_all_records) não quebra com cabeçalhos
+    # vazios/duplicados e não converte textos em números sem avisar.
+    values = worksheet.get_all_values()
+
+    # Se a aba configurada não parece ser a das inscrições, procura outra aba
+    # da planilha que seja (evita depender de worksheet_name estar certo).
+    if not values or not _looks_like_bands_sheet(values[0]):
+        for other in get_spreadsheet().worksheets():
+            if other.id == worksheet.id:
+                continue
+            if _looks_like_bands_sheet(other.row_values(1)):
+                worksheet, values = other, other.get_all_values()
+                break
+
+    if not values:
+        return pd.DataFrame(), worksheet.title
+
+    headers = _make_unique_headers(values[0])
+    width = len(headers)
+    rows = [(r + [""] * width)[:width] for r in values[1:]]  # linhas podem vir com tamanhos diferentes
+    df = pd.DataFrame(rows, columns=headers)
+
+    # Remove linhas totalmente vazias.
+    if not df.empty:
+        df = df[df.apply(lambda r: any(str(v).strip() for v in r), axis=1)].reset_index(drop=True)
+    return df, worksheet.title
 
 
 # ----------------------------------------------------------------------------
 # ABA INDIVIDUAL DE CADA CURADOR
 # ----------------------------------------------------------------------------
+def validate_curator_name(name: str, main_sheet_title: str) -> str | None:
+    """Devolve uma mensagem de erro se o nome não puder virar nome de aba."""
+    if len(name) > 100:
+        return "O nome do curador pode ter no máximo 100 caracteres."
+    # Evita gravar notas por cima da aba principal (nomes de aba são
+    # únicos sem diferenciar maiúsculas/minúsculas).
+    if name.casefold() == main_sheet_title.casefold():
+        return (
+            f"'{name}' é o nome da aba principal de respostas. "
+            "Use o seu próprio nome (ex.: Caio)."
+        )
+    return None
+
+
+@st.cache_resource(show_spinner=False)
 def get_or_create_curator_worksheet(curator_name: str) -> gspread.Worksheet:
     """
     Verifica se já existe uma aba com o nome exato do curador na planilha.
     Se não existir, cria a aba e grava o cabeçalho na Linha 1
     (Banda | Nota Resposta | Nota Vídeo | Nota Final).
+
+    Fica em cache (cache_resource) para não consultar a API do Google a cada
+    interação na tela, o que estouraria a cota de leituras por minuto.
     """
     spreadsheet = get_spreadsheet()
     try:
         worksheet = spreadsheet.worksheet(curator_name)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=curator_name, rows=200, cols=len(CURATOR_SHEET_HEADERS))
+        worksheet = spreadsheet.add_worksheet(title=curator_name, rows=1000, cols=len(CURATOR_SHEET_HEADERS))
         worksheet.update("A1", [CURATOR_SHEET_HEADERS])
     return worksheet
 
@@ -381,6 +517,10 @@ def save_vote_in_curator_sheet(curator_name: str, banda_nome: str, nota_resposta
         # Próxima linha livre = quantidade de valores na coluna A + 1.
         row_num = len(worksheet.col_values(1)) + 1
 
+    # Se a aba já estiver cheia, aumenta o grid (senão a API recusa a gravação).
+    if row_num > worksheet.row_count:
+        worksheet.add_rows(max(100, row_num - worksheet.row_count))
+
     formula_media = f"={AVERAGE_FUNCTION_NAME}(B{row_num}:C{row_num})"
 
     # value_input_option="USER_ENTERED" faz o Sheets interpretar a string
@@ -395,11 +535,77 @@ def save_vote_in_curator_sheet(curator_name: str, banda_nome: str, nota_resposta
 # ----------------------------------------------------------------------------
 # INTERFACE
 # ----------------------------------------------------------------------------
-def render_header(row: pd.Series) -> None:
+def field(row: pd.Series, cols: dict, key: str) -> str:
+    """Lê um campo da linha usando a coluna resolvida; devolve '' se não existir."""
+    col = cols.get(key)
+    if not col:
+        return ""
+    value = row.get(col, "")
+    return "" if pd.isna(value) else str(value).strip()
+
+
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+# Rótulo do botão conforme o domínio (a ordem importa: mais específico primeiro).
+_LINK_LABELS = {
+    "music.youtube.com": "🎵 YouTube Music",
+    "youtube.com": "▶️ YouTube",
+    "youtu.be": "▶️ YouTube",
+    "open.spotify.com": "🎧 Spotify",
+    "spotify.com": "🎧 Spotify",
+    "instagram.com": "📸 Instagram",
+    "deezer.com": "🎧 Deezer",
+    "music.apple.com": "🍎 Apple Music",
+    "soundcloud.com": "☁️ SoundCloud",
+    "bandcamp.com": "🎸 Bandcamp",
+    "linktr.ee": "🔗 Linktree",
+}
+
+
+def extract_links(value: str, kind: str = "generic") -> list[str]:
+    """
+    Extrai links http(s) de um campo de texto livre do Forms. Exemplos reais:
+      "Spotify: https://open.spotify.com/x  Youtube: https://youtu.be/y"  -> 2 links
+      "@kankrahc" / "Bandaghon" (kind="instagram")                         -> perfil
+      "linktr.ee/kankra"                                                   -> https://linktr.ee/kankra
+    Só devolve URLs http(s). Texto sem nenhum link reconhecível -> [].
+    """
+    value = value.strip()
+    if not value:
+        return []
+
+    urls = [u.rstrip(".,;:)") for u in _URL_RE.findall(value)]
+    if urls:
+        return list(dict.fromkeys(urls))  # sem repetidos, mantendo a ordem
+
+    if kind == "instagram":
+        if "instagram.com" in value.lower() and " " not in value:
+            return ["https://" + value.lstrip("/")]
+        handle = value.lstrip("@").strip("/")
+        if re.fullmatch(r"[A-Za-z0-9._]+", handle):
+            return [f"https://www.instagram.com/{handle}"]
+        return []
+
+    # domínio sem esquema (ex.: "linktr.ee/kankra")
+    if re.fullmatch(r"[\w-]+(\.[\w-]+)+(/\S*)?", value):
+        return ["https://" + value]
+    return []
+
+
+def link_label(url: str) -> str:
+    """Rótulo amigável do botão a partir do domínio do link."""
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    for domain, label in _LINK_LABELS.items():
+        if host == domain or host.endswith("." + domain):
+            return label
+    return f"🔗 {host or 'Link'}"
+
+
+def render_header(row: pd.Series, cols: dict) -> None:
     col_img, col_info = st.columns([1, 2.5], gap="large")
 
     with col_img:
-        foto_original = row.get(COLUMN_MAP["foto_promo"], "")
+        foto_original = field(row, cols, "foto_promo")
         foto_conteudo = convert_drive_image_url(foto_original)
         if foto_conteudo:
             st.image(foto_conteudo, use_container_width=True)
@@ -412,26 +618,25 @@ def render_header(row: pd.Series) -> None:
             st.info("Sem foto promocional cadastrada.")
 
     with col_info:
-        st.markdown(
-            f'<div class="band-name">{row.get(COLUMN_MAP["nome_da_banda"], "Banda sem nome")}</div>',
-            unsafe_allow_html=True,
+        nome = html.escape(field(row, cols, "nome_da_banda") or "Banda sem nome")
+        st.markdown(f'<div class="band-name">{nome}</div>', unsafe_allow_html=True)
+
+        links = extract_links(field(row, cols, "instagram_da_banda"), kind="instagram")
+        links += extract_links(field(row, cols, "streaming_da_banda"))
+        links = list(dict.fromkeys(links))
+
+        links_html = "".join(
+            f'<a class="link-pill" href="{html.escape(url, quote=True)}" '
+            f'target="_blank" rel="noopener noreferrer">{html.escape(link_label(url))}</a>'
+            for url in links
         )
-
-        instagram = row.get(COLUMN_MAP["instagram_da_banda"], "")
-        streaming = row.get(COLUMN_MAP["streaming_da_banda"], "")
-
-        links_html = ""
-        if instagram:
-            links_html += f'<a class="link-pill" href="{instagram}" target="_blank">📸 Instagram</a>'
-        if streaming:
-            links_html += f'<a class="link-pill" href="{streaming}" target="_blank">🎧 Streaming</a>'
         if links_html:
             st.markdown(links_html, unsafe_allow_html=True)
 
 
-def render_video(row: pd.Series) -> None:
+def render_video(row: pd.Series, cols: dict) -> None:
     st.markdown('<div class="section-title">🎬 Vídeo da banda</div>', unsafe_allow_html=True)
-    video_url = row.get(COLUMN_MAP["video_da_banda"], "")
+    video_url = field(row, cols, "video_da_banda")
     media = convert_media_to_embed(video_url)
 
     if media["type"] in ("youtube", "direct"):
@@ -448,18 +653,17 @@ def render_video(row: pd.Series) -> None:
         st.warning("Nenhum vídeo cadastrado para esta banda.")
 
 
-def render_voting_form(curator_name: str, banda_nome: str, row: pd.Series, pending_bandas: list[str]) -> None:
+def render_voting_form(
+    curator_name: str, banda_nome: str, row: pd.Series, cols: dict, pending_bandas: list[str]
+) -> None:
     st.markdown('<div class="section-title">✅ Avaliação</div>', unsafe_allow_html=True)
 
-    # Texto da banda respondendo à pergunta oficial do Forms, exibido em
-    # destaque dentro do próprio bloco de avaliação (é um dos critérios).
-    # >>> Ajuste COLUMN_MAP["resposta_lineup"] se o cabeçalho da coluna na
-    # sua planilha não for exatamente "Por que você merece estar no lineup?".
-    resposta_lineup = row.get(COLUMN_MAP["resposta_lineup"], "")
+    # Texto da banda respondendo à pergunta oficial do Forms, em destaque
+    # dentro do bloco de avaliação (é um dos critérios de votação).
+    resposta_lineup = field(row, cols, "resposta_lineup")
     st.markdown("**📝 Por que a banda acha que merece estar no lineup:**")
-    if str(resposta_lineup).strip():
-        texto_seguro = html.escape(str(resposta_lineup))
-        st.markdown(f'<div class="lineup-box">{texto_seguro}</div>', unsafe_allow_html=True)
+    if resposta_lineup:
+        st.markdown(f'<div class="lineup-box">{html.escape(resposta_lineup)}</div>', unsafe_allow_html=True)
     else:
         st.info("Nenhuma resposta cadastrada para esta pergunta.")
 
@@ -492,10 +696,9 @@ def render_voting_form(curator_name: str, banda_nome: str, row: pd.Series, pendi
             time.sleep(0.3)  # pequena pausa para garantir a propagação na API
             load_curator_votes(curator_name, force_refresh=True)
 
-        st.success("Notas registradas com sucesso!")
-
         remaining = [b for b in pending_bandas if b != banda_nome]
         st.session_state["current_banda"] = remaining[0] if remaining else None
+        st.toast("Notas registradas com sucesso!", icon="✅")
         st.rerun()
 
 
@@ -505,10 +708,8 @@ def render_voting_form(curator_name: str, banda_nome: str, row: pd.Series, pendi
 def main() -> None:
     st.title("🎸 Curadoria de Seletivas de Bandas")
 
-    # ------------------------------------------------------------------
     # Identificação do curador (sidebar). O nome define em qual aba da
     # planilha as notas dele serão gravadas.
-    # ------------------------------------------------------------------
     with st.sidebar:
         st.header("⚙️ Painel")
         curator_name = st.text_input(
@@ -519,11 +720,64 @@ def main() -> None:
         ).strip()
         st.session_state["curator_name"] = curator_name
 
+    # ------------------------------------------------------------------
+    # 1) Dados das bandas (planilha principal)
+    # ------------------------------------------------------------------
+    try:
+        df, sheet_title = load_bands_data()
+    except Exception as exc:  # noqa: BLE001
+        st.error(
+            "Não foi possível carregar a planilha principal. Verifique suas "
+            "credenciais em `.streamlit/secrets.toml`/variáveis de ambiente, o "
+            "`worksheet_name` e o compartilhamento da planilha com a conta de serviço."
+        )
+        st.exception(exc)
+        return
+
+    if len(df.columns) == 0:
+        st.warning(f"A aba '{sheet_title}' está vazia (sem cabeçalho).")
+        return
+
+    # ------------------------------------------------------------------
+    # 2) Descobre quais colunas reais correspondem a cada campo
+    # ------------------------------------------------------------------
+    cols = resolve_columns(df.columns)
+
+    with st.sidebar:
+        with st.expander("🔎 Colunas detectadas"):
+            st.caption(f"Aba lida: **{sheet_title}**")
+            for key, col in cols.items():
+                st.markdown(f"`{key}` → " + (f"`{col}`" if col else "❌ não encontrada"))
+
+    missing_required = [k for k in REQUIRED_COLUMNS if not cols.get(k)]
+    if missing_required:
+        st.error(
+            f"Não encontrei na aba **{sheet_title}** a(s) coluna(s) obrigatória(s): "
+            + ", ".join(f"`{k}`" for k in missing_required)
+            + ". Ajuste o `COLUMN_MAP` no topo do `app.py` com o cabeçalho exato "
+            "(copie de uma das colunas abaixo) ou confira se `worksheet_name` aponta "
+            "para a aba certa."
+        )
+        st.markdown("**Colunas encontradas nessa aba:**")
+        st.code("\n".join(str(c) for c in df.columns))
+        return
+
+    if df.empty:
+        st.warning("A planilha principal ainda não tem nenhuma resposta.")
+        return
+
+    # ------------------------------------------------------------------
+    # 3) Curador e aba individual
+    # ------------------------------------------------------------------
     if not curator_name:
         st.info("👋 Digite seu nome na barra lateral para começar a avaliar as bandas.")
         return
 
-    # Garante (cria se preciso) a aba do curador antes de seguir.
+    erro_nome = validate_curator_name(curator_name, sheet_title)
+    if erro_nome:
+        st.error(erro_nome)
+        return
+
     try:
         get_or_create_curator_worksheet(curator_name)
     except Exception as exc:  # noqa: BLE001
@@ -535,31 +789,19 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------------
-    # Dados das bandas (planilha principal) + votos já dados pelo curador
+    # 4) Fila de bandas pendentes para ESTE curador
     # ------------------------------------------------------------------
-    try:
-        df = load_bands_data()
-    except Exception as exc:  # noqa: BLE001
-        st.error(
-            "Não foi possível carregar a planilha principal. Verifique suas "
-            "credenciais em `.streamlit/secrets.toml` e o compartilhamento "
-            "da planilha com a conta de serviço."
-        )
-        st.exception(exc)
-        return
-
-    if df.empty:
-        st.warning("A planilha principal ainda não tem nenhuma resposta.")
-        return
+    nomes = df[cols["nome_da_banda"]].astype(str).str.strip()
+    df = df[nomes != ""]
+    nomes = nomes[nomes != ""]
 
     curator_votes = load_curator_votes(curator_name)
 
-    todas_bandas = df[COLUMN_MAP["nome_da_banda"]].astype(str).tolist()
+    todas_bandas = list(dict.fromkeys(nomes))  # únicos, preservando a ordem
     pending_bandas = [b for b in todas_bandas if b not in curator_votes]
 
-    if "current_banda" not in st.session_state or st.session_state["current_banda"] not in pending_bandas:
+    if st.session_state.get("current_banda") not in pending_bandas:
         st.session_state["current_banda"] = pending_bandas[0] if pending_bandas else None
-
     current_banda = st.session_state["current_banda"]
 
     total = len(todas_bandas)
@@ -577,25 +819,23 @@ def main() -> None:
     if current_banda is None:
         st.balloons()
         st.success(f"🎉 {curator_name}, você já avaliou todas as {total} bandas!")
-        return          
+        return
 
     st.markdown(
         f'<div class="progress-tag">Banda pendente {votadas + 1} de {total} '
-        f"&nbsp;·&nbsp; {len(pending_bandas)} restantes &nbsp;·&nbsp; curador: <b>{curator_name}</b></div>",
+        f"&nbsp;·&nbsp; {len(pending_bandas)} restantes &nbsp;·&nbsp; curador: <b>{html.escape(curator_name)}</b></div>",
         unsafe_allow_html=True,
     )
     st.progress(votadas / total if total else 0)
 
-    row = df[df[COLUMN_MAP["nome_da_banda"]].astype(str) == current_banda].iloc[0]
+    row = df[nomes == current_banda].iloc[0]
 
-    render_header(row)
+    render_header(row, cols)
     st.divider()
-    render_video(row)
+    render_video(row, cols)
     st.divider()
-    render_voting_form(curator_name, current_banda, row, pending_bandas)
+    render_voting_form(curator_name, current_banda, row, cols, pending_bandas)
 
 
 if __name__ == "__main__":
     main()
-
-web: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
