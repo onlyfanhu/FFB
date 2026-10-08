@@ -71,6 +71,10 @@ CURATOR_SHEET_HEADERS = ["Banda", "Nota Resposta", "Nota Vídeo", "Nota Final"]
 # planilha → Geral → Idioma da localidade).
 AVERAGE_FUNCTION_NAME = "MÉDIA"
 
+# Aparece na barra lateral: serve para conferir qual versão do código o
+# servidor está realmente executando (útil após um deploy).
+APP_VERSION = "2026-10-07 · detecção automática de colunas/aba"
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -712,6 +716,7 @@ def main() -> None:
     # planilha as notas dele serão gravadas.
     with st.sidebar:
         st.header("⚙️ Painel")
+        st.caption(f"versão: {APP_VERSION}")
         curator_name = st.text_input(
             "Seu nome (curador)",
             value=st.session_state.get("curator_name", ""),
